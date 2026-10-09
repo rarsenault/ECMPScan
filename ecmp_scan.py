@@ -649,10 +649,14 @@ def print_text_summary(
     else:
         notes = []
         if counts["timeout"]:
+            timeout_label = (
+                "probe timed out" if counts["timeout"] == 1 else "probes timed out"
+            )
             notes.append(
-                "Repeated timeouts on the same source ports may indicate "
-                "source-port-dependent behavior, but do not prove ECMP or "
-                "identify a fault."
+                f"{counts['timeout']} {timeout_label}; the TCP handshake did not "
+                "complete before the timeout. Repeating the scan can show whether "
+                "timeouts consistently affect particular source ports, but this "
+                "alone does not prove ECMP or locate a fault."
             )
         if counts["refused"]:
             notes.append(

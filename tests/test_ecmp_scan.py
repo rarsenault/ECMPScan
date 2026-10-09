@@ -272,7 +272,8 @@ class TextSummaryTests(unittest.TestCase):
             ecmp_scan.print_text_summary("192.0.2.10", 443, results)
 
         interpretation = output.getvalue().split("Interpretation: ", 1)[1]
-        self.assertIn("Repeated timeouts on the same source ports", interpretation)
+        self.assertIn("1 probe timed out", interpretation)
+        self.assertIn("Repeating the scan can show", interpretation)
         self.assertIn("SOURCE-PORT-BUSY is a local bind conflict", interpretation)
         self.assertNotIn("Refused probes", interpretation)
         self.assertNotIn("ERROR probes", interpretation)
