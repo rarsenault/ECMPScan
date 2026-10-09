@@ -1,4 +1,5 @@
 import socket
+import struct
 import threading
 import unittest
 from unittest.mock import patch
@@ -42,17 +43,55 @@ class PortRangeTests(unittest.TestCase):
 
 
 class SecondaryDiagnosticTests(unittest.TestCase):
-    def test_trace_parser_ignores_round_trip_times(self):
-        hops = ecmp_scan._parse_trace_hops(
-            " 1  192.0.2.1  1.23 ms\n 2  *\n"
-        )
+    def test_icmp_trace_reply_matches_quoted_tcp_ports(self):
+        packet = bytearray(52)
+        packet[0] = 0x45
+        packet[9] = socket.IPPROTO_ICMP
+        packet[12:16] = socket.inet_aton("192.0.2.1")
+        packet[20:22] = bytes((11, 0))
+        packet[28] = 0x45
+        packet[37] = socket.IPPROTO_TCP
+        packet[44:48] = socket.inet_aton("192.0.2.20")
+        struct.pack_into("!HH", packet, 48, 45000, 443)
 
         self.assertEqual(
-            hops,
-            [
-                ecmp_scan.TraceHop(1, "192.0.2.1"),
-                ecmp_scan.TraceHop(2, "*"),
-            ],
+            ecmp_scan._parse_icmp_trace_reply(
+                bytes(packet), 45000, 443, "192.0.2.20"
+            ),
+            ("192.0.2.1", False),
+        )
+        self.assertIsNone(
+            ecmp_scan._parse_icmp_trace_reply(
+                bytes(packet), 45001, 443, "192.0.2.20"
+            )
+        )
+        self.assertIsNone(
+            ecmp_scan._parse_icmp_trace_reply(
+                bytes(packet), 45000, 443, "192.0.2.21"
+            )
+        )
+
+    def test_icmpv6_trace_reply_matches_quoted_tcp_flow(self):
+        packet = bytearray(8 + 40 + 20)
+        packet[0] = 3
+        quoted_offset = 8
+        packet[quoted_offset] = 0x60
+        packet[quoted_offset + 6] = socket.IPPROTO_TCP
+        packet[quoted_offset + 24:quoted_offset + 40] = socket.inet_pton(
+            socket.AF_INET6, "2001:db8::20"
+        )
+        struct.pack_into("!HH", packet, quoted_offset + 40, 45000, 443)
+
+        self.assertEqual(
+            ecmp_scan._parse_icmpv6_trace_reply(
+                bytes(packet), "2001:db8::1", 45000, 443, "2001:db8::20"
+            ),
+            ("2001:db8::1", False),
+        )
+        self.assertIsNone(
+            ecmp_scan._parse_icmpv6_trace_reply(
+                bytes(packet), "2001:db8::1", 45001, 443, "2001:db8::20"
+            )
         )
 
     def test_only_traces_ports_with_consistent_mixed_results(self):

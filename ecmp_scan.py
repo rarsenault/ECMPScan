@@ -7,10 +7,9 @@ import argparse
 import errno
 import ipaddress
 import json
-import re
-import shutil
+import select
 import socket
-import subprocess
+import struct
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -220,15 +219,84 @@ def scan(
     return results
 
 
-def _parse_trace_hops(output: str) -> list[TraceHop]:
-    hops = []
-    for line in output.splitlines():
-        match = re.match(r"^\s*(\d+)\s+(.+?)\s*$", line)
-        if match:
-            # Compare router identities, not variable round-trip-time text.
-            responder = match.group(2).split()[0]
-            hops.append(TraceHop(ttl=int(match.group(1)), response=responder))
-    return hops
+def _parse_icmp_trace_reply(
+    packet: bytes,
+    source_port: int,
+    destination_port: int,
+    target_address: str,
+) -> tuple[str, bool] | None:
+    if len(packet) < 20:
+        return None
+    if packet[0] >> 4 != 4:
+        return None
+    outer_header_length = (packet[0] & 0x0F) * 4
+    if outer_header_length < 20 or len(packet) < outer_header_length + 8 + 20:
+        return None
+    if packet[9] != socket.IPPROTO_ICMP:
+        return None
+
+    icmp_offset = outer_header_length
+    icmp_type, icmp_code = packet[icmp_offset], packet[icmp_offset + 1]
+    if icmp_type not in (3, 11):
+        return None
+
+    quoted_offset = icmp_offset + 8
+    if packet[quoted_offset] >> 4 != 4:
+        return None
+    quoted_header_length = (packet[quoted_offset] & 0x0F) * 4
+    if (
+        quoted_header_length < 20
+        or len(packet) < quoted_offset + quoted_header_length + 4
+        or packet[quoted_offset + 9] != socket.IPPROTO_TCP
+        or packet[quoted_offset + 16:quoted_offset + 20]
+        != socket.inet_aton(target_address)
+    ):
+        return None
+    quoted_source_port, quoted_destination_port = struct.unpack_from(
+        "!HH", packet, quoted_offset + quoted_header_length
+    )
+    if (
+        quoted_source_port != source_port
+        or quoted_destination_port != destination_port
+    ):
+        return None
+
+    responder = socket.inet_ntoa(packet[12:16])
+    terminal = icmp_type == 3
+    if terminal:
+        responder = f"{responder} (unreachable code {icmp_code})"
+    return responder, terminal
+
+
+def _parse_icmpv6_trace_reply(
+    packet: bytes,
+    responder: str,
+    source_port: int,
+    destination_port: int,
+    target_address: str,
+) -> tuple[str, bool] | None:
+    quoted_offset = 8
+    if len(packet) < quoted_offset + 40 + 4 or packet[0] not in (1, 3):
+        return None
+    quoted = packet[quoted_offset:]
+    if (
+        quoted[0] >> 4 != 6
+        or quoted[6] != socket.IPPROTO_TCP
+        or quoted[24:40] != socket.inet_pton(socket.AF_INET6, target_address)
+    ):
+        return None
+    quoted_source_port, quoted_destination_port = struct.unpack_from(
+        "!HH", quoted, 40
+    )
+    if (
+        quoted_source_port != source_port
+        or quoted_destination_port != destination_port
+    ):
+        return None
+    terminal = packet[0] == 1
+    if terminal:
+        responder = f"{responder} (unreachable code {packet[1]})"
+    return responder, terminal
 
 
 def _run_tcp_trace(
@@ -238,57 +306,156 @@ def _run_tcp_trace(
     source_address: str | None,
     timeout: float,
 ) -> PathTrace:
-    traceroute = shutil.which("traceroute")
-    if not traceroute:
+    try:
+        target_ip = ipaddress.ip_address(target)
+    except ValueError:
+        try:
+            source_ip = (
+                ipaddress.ip_address(source_address) if source_address else None
+            )
+            family = socket.AF_UNSPEC
+            if source_ip:
+                family = socket.AF_INET if source_ip.version == 4 else socket.AF_INET6
+            target_ip = ipaddress.ip_address(
+                socket.getaddrinfo(
+                    target, destination_port, family, socket.SOCK_STREAM
+                )[0][4][0]
+            )
+        except (OSError, IndexError, ValueError) as exc:
+            return PathTrace(
+                source_port=source_port,
+                error=f"could not resolve trace destination: {exc}",
+            )
+
+    family = socket.AF_INET if target_ip.version == 4 else socket.AF_INET6
+    raw_protocol = socket.IPPROTO_ICMP if target_ip.version == 4 else socket.IPPROTO_ICMPV6
+    ttl_option = socket.IP_TTL if target_ip.version == 4 else socket.IPV6_UNICAST_HOPS
+    wildcard = "0.0.0.0" if target_ip.version == 4 else "::"
+    try:
+        if source_address and ipaddress.ip_address(source_address).version != target_ip.version:
+            raise ValueError("source and destination address families differ")
+        icmp_socket = socket.socket(family, socket.SOCK_RAW, raw_protocol)
+    except (OSError, ValueError) as exc:
         return PathTrace(
             source_port=source_port,
             error=(
-                "the Linux traceroute command was not found; "
-                "TCP traceroute with a fixed source port is unavailable"
+                "could not open the ICMP receive socket for the built-in trace "
+                f"(administrator/root privileges may be required): {exc}"
             ),
         )
 
-    command = [
-        traceroute,
-        "-n",
-        "-T",
-        "-p", str(destination_port),
-        f"--sport={source_port}",
-        "-q", "1",
-        "-w", str(timeout),
-        "-m", "30",
-    ]
-    if source_address:
-        command.extend(["-s", source_address])
-    command.append(target)
+    hops = []
+    pending_connect_errors = {
+        errno.EINPROGRESS,
+        errno.EWOULDBLOCK,
+        errno.EALREADY,
+        errno.EINTR,
+        10035,  # WSAEWOULDBLOCK
+    }
+    with icmp_socket:
+        icmp_socket.setblocking(False)
+        for ttl in range(1, 31):
+            while True:
+                try:
+                    icmp_socket.recvfrom(4096)
+                except BlockingIOError:
+                    break
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as probe_socket:
+                    probe_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    level = socket.IPPROTO_IP if target_ip.version == 4 else socket.IPPROTO_IPV6
+                    probe_socket.setsockopt(level, ttl_option, ttl)
+                    probe_socket.setblocking(False)
+                    bind_address = source_address or wildcard
+                    bind_tuple = (
+                        (bind_address, source_port)
+                        if target_ip.version == 4
+                        else (bind_address, source_port, 0, 0)
+                    )
+                    destination = (
+                        (str(target_ip), destination_port)
+                        if target_ip.version == 4
+                        else (str(target_ip), destination_port, 0, 0)
+                    )
+                    probe_socket.bind(bind_tuple)
+                    connect_error = probe_socket.connect_ex(
+                        destination
+                    )
+                    if connect_error == 0 or connect_error == errno.ECONNREFUSED:
+                        hops.append(TraceHop(ttl, str(target_ip)))
+                        break
+                    if connect_error not in pending_connect_errors:
+                        return PathTrace(
+                            source_port=source_port,
+                            hops=hops,
+                            error=f"TCP trace probe failed at TTL {ttl}: "
+                            f"{os_error_text(connect_error)}",
+                        )
 
+                    deadline = time.monotonic() + timeout
+                    reached_destination = False
+                    while time.monotonic() < deadline:
+                        remaining = deadline - time.monotonic()
+                        readable, writable, _ = select.select(
+                            [icmp_socket], [probe_socket], [], remaining
+                        )
+                        if icmp_socket in readable:
+                            packet, address = icmp_socket.recvfrom(4096)
+                            if target_ip.version == 4:
+                                reply = _parse_icmp_trace_reply(
+                                    packet, source_port, destination_port, str(target_ip)
+                                )
+                            else:
+                                reply = _parse_icmpv6_trace_reply(
+                                    packet,
+                                    address[0],
+                                    source_port,
+                                    destination_port,
+                                    str(target_ip),
+                                )
+                            if reply:
+                                responder, terminal = reply
+                                hops.append(TraceHop(ttl, responder))
+                                reached_destination = terminal
+                                break
+                        if probe_socket in writable:
+                            socket_error = probe_socket.getsockopt(
+                                socket.SOL_SOCKET, socket.SO_ERROR
+                            )
+                            if socket_error in (0, errno.ECONNREFUSED, 10061):
+                                hops.append(TraceHop(ttl, str(target_ip)))
+                                reached_destination = True
+                                break
+                            if socket_error not in pending_connect_errors:
+                                break
+                    else:
+                        hops.append(TraceHop(ttl, "*"))
+                    if reached_destination:
+                        break
+            except OSError as exc:
+                return PathTrace(
+                    source_port=source_port,
+                    hops=hops,
+                    error=f"TCP trace probe failed at TTL {ttl}: {exc}",
+                )
+            if hops and hops[-1].ttl == ttl and (
+                hops[-1].response == str(target_ip)
+                or "unreachable code" in hops[-1].response
+            ):
+                break
+    if not hops:
+        return PathTrace(
+            source_port=source_port,
+            error="the built-in trace received no usable hop responses",
+        )
+    return PathTrace(source_port=source_port, hops=hops)
+
+
+def os_error_text(error_number: int) -> str:
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=max(10.0, 30 * timeout + 5),
-        )
-    except subprocess.TimeoutExpired:
-        return PathTrace(
-            source_port=source_port,
-            error="traceroute exceeded its overall time limit",
-        )
-    except OSError as exc:
-        return PathTrace(
-            source_port=source_port,
-            error=f"could not run traceroute: {exc}",
-        )
-
-    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
-    hops = _parse_trace_hops(output)
-    error = None
-    if completed.returncode:
-        error = output.strip() or f"traceroute exited with status {completed.returncode}"
-    elif not hops:
-        error = "traceroute completed without parseable hop responses"
-    return PathTrace(source_port=source_port, hops=hops, error=error)
+        return OSError(error_number, "").strerror or f"socket error {error_number}"
+    except OSError:
+        return f"socket error {error_number}"
 
 
 def perform_secondary_diagnostics(
