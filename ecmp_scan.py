@@ -142,6 +142,16 @@ def resolve_target(
     )
 
 
+def _configure_source_port_socket(connection: socket.socket) -> None:
+    if sys.platform == "win32":
+        # An abortive close avoids Windows retaining this fixed tuple in TIME_WAIT.
+        connection.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("HH", 1, 0)
+        )
+    else:
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 def probe(
     attempt: int,
     source_port: int,
@@ -155,7 +165,7 @@ def probe(
     started = time.monotonic()
     try:
         with socket.socket(family, socktype, proto) as connection:
-            connection.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            _configure_source_port_socket(connection)
             connection.settimeout(timeout)
             if family == socket.AF_INET6:
                 bind_address = source_address or "::"
@@ -170,11 +180,18 @@ def probe(
         outcome = "timeout"
         error = str(exc) or "connection timed out"
     except OSError as exc:
+        error = str(exc)
         if exc.errno == errno.ECONNREFUSED or getattr(exc, "winerror", None) == 10061:
             outcome = "refused"
+        elif exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
+            outcome = "source-port-busy"
+            error = (
+                f"local source port {source_port} is already in use or in "
+                f"TCP TIME_WAIT; this is a local bind conflict, not a "
+                f"destination failure ({exc})"
+            )
         else:
             outcome = "error"
-        error = str(exc)
     return ProbeResult(
         attempt=attempt,
         source_port=source_port,
@@ -362,7 +379,7 @@ def _run_tcp_trace(
                     break
             try:
                 with socket.socket(family, socket.SOCK_STREAM) as probe_socket:
-                    probe_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    _configure_source_port_socket(probe_socket)
                     level = socket.IPPROTO_IP if target_ip.version == 4 else socket.IPPROTO_IPV6
                     probe_socket.setsockopt(level, ttl_option, ttl)
                     probe_socket.setblocking(False)
@@ -619,16 +636,40 @@ def print_text_summary(
 
     counts = {
         outcome: sum(result.outcome == outcome for result in results)
-        for outcome in ("connected", "timeout", "refused", "error")
+        for outcome in ("connected", "timeout", "refused", "source-port-busy", "error")
     }
     print(
         "\nSummary: "
         + ", ".join(f"{outcome}={count}" for outcome, count in counts.items())
     )
-    print(
-        "Interpretation: repeated source-port-specific failures can be a clue "
-        "for path/hash issues, but do not by themselves identify ECMP as the cause."
-    )
+    if not results:
+        interpretation = "No probes were run."
+    elif counts["connected"] == len(results):
+        interpretation = "All probes connected; no failures were observed."
+    else:
+        notes = []
+        if counts["timeout"]:
+            notes.append(
+                "Repeated timeouts on the same source ports may indicate "
+                "source-port-dependent behavior, but do not prove ECMP or "
+                "identify a fault."
+            )
+        if counts["refused"]:
+            notes.append(
+                "Refused probes were actively rejected; they are not successful "
+                "handshakes."
+            )
+        if counts["source-port-busy"]:
+            notes.append(
+                "SOURCE-PORT-BUSY is a local bind conflict; no network probe "
+                "was made for those attempts."
+            )
+        if counts["error"]:
+            notes.append(
+                "ERROR probes were inconclusive; see their per-probe error text."
+            )
+        interpretation = " ".join(notes)
+    print(f"Interpretation: {interpretation}")
 
 
 def print_diagnosis(diagnosis: PathDiagnosis) -> None:
