@@ -10,6 +10,19 @@ import ecmp_scan
 
 
 class PortRangeTests(unittest.TestCase):
+    def test_resolve_target_matches_source_address_family(self):
+        addresses = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 80, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80)),
+        ]
+        with patch.object(socket, "getaddrinfo", return_value=addresses):
+            result = ecmp_scan.resolve_target("localhost", 80, "127.0.0.1")
+
+        self.assertEqual(
+            result,
+            (socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", 80)),
+        )
+
     def test_windows_uses_abortive_close_for_fixed_source_ports(self):
         connection = unittest.mock.Mock()
         with patch.object(ecmp_scan.sys, "platform", "win32"):
@@ -61,102 +74,27 @@ class PortRangeTests(unittest.TestCase):
             [45000, 45001, 45000, 45001],
         )
 
+    def test_scan_reports_each_result_before_starting_the_next_probe(self):
+        events = []
 
-class SecondaryDiagnosticTests(unittest.TestCase):
-    def test_icmp_trace_reply_matches_quoted_tcp_ports(self):
-        packet = bytearray(52)
-        packet[0] = 0x45
-        packet[9] = socket.IPPROTO_ICMP
-        packet[12:16] = socket.inet_aton("192.0.2.1")
-        packet[20:22] = bytes((11, 0))
-        packet[28] = 0x45
-        packet[37] = socket.IPPROTO_TCP
-        packet[44:48] = socket.inet_aton("192.0.2.20")
-        struct.pack_into("!HH", packet, 48, 45000, 443)
-
-        self.assertEqual(
-            ecmp_scan._parse_icmp_trace_reply(
-                bytes(packet), 45000, 443, "192.0.2.20"
-            ),
-            ("192.0.2.1", False),
-        )
-        self.assertIsNone(
-            ecmp_scan._parse_icmp_trace_reply(
-                bytes(packet), 45001, 443, "192.0.2.20"
-            )
-        )
-        self.assertIsNone(
-            ecmp_scan._parse_icmp_trace_reply(
-                bytes(packet), 45000, 443, "192.0.2.21"
-            )
-        )
-
-    def test_icmpv6_trace_reply_matches_quoted_tcp_flow(self):
-        packet = bytearray(8 + 40 + 20)
-        packet[0] = 3
-        quoted_offset = 8
-        packet[quoted_offset] = 0x60
-        packet[quoted_offset + 6] = socket.IPPROTO_TCP
-        packet[quoted_offset + 24:quoted_offset + 40] = socket.inet_pton(
-            socket.AF_INET6, "2001:db8::20"
-        )
-        struct.pack_into("!HH", packet, quoted_offset + 40, 45000, 443)
-
-        self.assertEqual(
-            ecmp_scan._parse_icmpv6_trace_reply(
-                bytes(packet), "2001:db8::1", 45000, 443, "2001:db8::20"
-            ),
-            ("2001:db8::1", False),
-        )
-        self.assertIsNone(
-            ecmp_scan._parse_icmpv6_trace_reply(
-                bytes(packet), "2001:db8::1", 45001, 443, "2001:db8::20"
-            )
-        )
-
-    def test_only_traces_ports_with_consistent_mixed_results(self):
-        results = [
-            ecmp_scan.ProbeResult(1, 45000, "timeout", 1000),
-            ecmp_scan.ProbeResult(2, 45001, "connected", 20),
-            ecmp_scan.ProbeResult(3, 45000, "timeout", 1000),
-            ecmp_scan.ProbeResult(4, 45001, "connected", 20),
-        ]
-        with patch.object(
-            ecmp_scan,
-            "_run_tcp_trace",
-            side_effect=[
-                ecmp_scan.PathTrace(
-                    source_port=45001,
-                    hops=[ecmp_scan.TraceHop(1, "192.0.2.1")],
-                ),
-                ecmp_scan.PathTrace(
-                    source_port=45000,
-                    hops=[ecmp_scan.TraceHop(1, "192.0.2.2")],
-                ),
-            ],
-        ) as run_trace:
-            diagnosis = ecmp_scan.perform_secondary_diagnostics(
-                "192.0.2.10", 443, results, 2, None, 1.0
+        def run_probe(**kwargs):
+            events.append(("probe", kwargs["attempt"]))
+            return ecmp_scan.ProbeResult(
+                kwargs["attempt"], kwargs["source_port"], "connected", 1.0
             )
 
-        self.assertEqual(diagnosis.status, "compared")
-        self.assertEqual(run_trace.call_count, 2)
-        self.assertIn("TTL 1", diagnosis.best_guess)
-
-    def test_does_not_trace_unstable_or_unpaired_results(self):
-        results = [
-            ecmp_scan.ProbeResult(1, 45000, "timeout", 1000),
-            ecmp_scan.ProbeResult(2, 45001, "connected", 20),
-            ecmp_scan.ProbeResult(3, 45000, "connected", 20),
-            ecmp_scan.ProbeResult(4, 45001, "connected", 20),
-        ]
-        with patch.object(ecmp_scan, "_run_tcp_trace") as run_trace:
-            diagnosis = ecmp_scan.perform_secondary_diagnostics(
-                "192.0.2.10", 443, results, 2, None, 1.0
+        with patch.object(ecmp_scan, "resolve_target", return_value=(
+            socket.AF_INET, socket.SOCK_STREAM, 0, ("127.0.0.1", 80)
+        )), patch.object(ecmp_scan, "probe", side_effect=run_probe):
+            ecmp_scan.scan(
+                "127.0.0.1", 80, 2, 45000, None, 1.0, 0,
+                on_result=lambda result: events.append(("reported", result.attempt)),
             )
 
-        self.assertEqual(diagnosis.status, "insufficient_evidence")
-        run_trace.assert_not_called()
+        self.assertEqual(events, [
+            ("probe", 1), ("reported", 1),
+            ("probe", 2), ("reported", 2),
+        ])
 
 
 class LocalConnectionTests(unittest.TestCase):
@@ -277,6 +215,22 @@ class TextSummaryTests(unittest.TestCase):
         self.assertIn("SOURCE-PORT-BUSY is a local bind conflict", interpretation)
         self.assertNotIn("Refused probes", interpretation)
         self.assertNotIn("ERROR probes", interpretation)
+
+    def test_mixed_multiple_failures_suggest_checking_source_port_consistency(self):
+        results = [
+            ecmp_scan.ProbeResult(1, 45000, "connected", 20),
+            ecmp_scan.ProbeResult(2, 45001, "timeout", 1000),
+            ecmp_scan.ProbeResult(3, 45002, "refused", 5),
+        ]
+        output = StringIO()
+
+        with redirect_stdout(output):
+            ecmp_scan.print_text_summary("192.0.2.10", 443, results)
+
+        interpretation = output.getvalue().split("Interpretation: ", 1)[1]
+        self.assertIn("may indicate an ECMP-related issue, but do not prove one", interpretation)
+        self.assertIn("same source ports fail consistently", interpretation)
+        self.assertIn("would make ECMP more likely", interpretation)
 
 
 if __name__ == "__main__":

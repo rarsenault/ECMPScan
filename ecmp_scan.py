@@ -7,13 +7,12 @@ import argparse
 import errno
 import ipaddress
 import json
-import select
 import socket
 import struct
 import sys
 import time
-from dataclasses import asdict, dataclass, field
-from typing import Sequence
+from dataclasses import asdict, dataclass
+from typing import Callable, Sequence
 
 
 @dataclass(frozen=True)
@@ -23,29 +22,6 @@ class ProbeResult:
     outcome: str
     elapsed_ms: float
     error: str | None = None
-
-
-@dataclass(frozen=True)
-class TraceHop:
-    ttl: int
-    response: str
-
-
-@dataclass
-class PathTrace:
-    source_port: int
-    hops: list[TraceHop] = field(default_factory=list)
-    error: str | None = None
-
-
-@dataclass
-class PathDiagnosis:
-    status: str
-    reason: str
-    successful_source_ports: list[int] = field(default_factory=list)
-    failing_source_ports: list[int] = field(default_factory=list)
-    traces: list[PathTrace] = field(default_factory=list)
-    best_guess: str = ""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -86,13 +62,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="repeat the complete source-port range (default: 1)",
     )
     parser.add_argument(
-        "--trace-diagnostics", action="store_true",
-        help=(
-            "after at least two repeats, compare TCP traceroutes for "
-            "consistently successful and timed-out source ports"
-        ),
-    )
-    parser.add_argument(
         "--json", action="store_true", dest="json_output",
         help="print machine-readable JSON instead of a text summary",
     )
@@ -106,8 +75,6 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("count must be at least 1")
     if args.repeats < 1:
         parser.error("repeats must be at least 1")
-    if args.trace_diagnostics and args.repeats < 2:
-        parser.error("--trace-diagnostics requires --repeats of at least 2")
     if not 1 <= args.source_port_start <= 65535:
         parser.error("source-port-start must be between 1 and 65535")
     if args.source_port_start + args.count - 1 > 65535:
@@ -127,15 +94,16 @@ def resolve_target(
     target: str, port: int, source_address: str | None
 ) -> tuple[int, int, int, tuple]:
     source_ip = ipaddress.ip_address(source_address) if source_address else None
+    source_family = (
+        {4: socket.AF_INET, 6: socket.AF_INET6}[source_ip.version]
+        if source_ip
+        else None
+    )
     records = socket.getaddrinfo(
         target, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
     )
     for family, socktype, proto, _canonical_name, sockaddr in records:
-        if source_ip is None or (
-            family == socket.AF_INET and source_ip.version == 4
-        ) or (
-            family == socket.AF_INET6 and source_ip.version == 6
-        ):
+        if source_family is None or family == source_family:
             return family, socktype, proto, sockaddr
     raise ValueError(
         f"no address for {target!r} matches source address {source_address!r}"
@@ -181,9 +149,10 @@ def probe(
         error = str(exc) or "connection timed out"
     except OSError as exc:
         error = str(exc)
-        if exc.errno == errno.ECONNREFUSED or getattr(exc, "winerror", None) == 10061:
+        error_code = getattr(exc, "winerror", None) or exc.errno
+        if error_code in (errno.ECONNREFUSED, 10061):
             outcome = "refused"
-        elif exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
+        elif error_code in (errno.EADDRINUSE, 10048):
             outcome = "source-port-busy"
             error = (
                 f"local source port {source_port} is already in use or in "
@@ -210,429 +179,51 @@ def scan(
     timeout: float,
     interval: float,
     repeats: int = 1,
+    on_result: Callable[[ProbeResult], None] | None = None,
 ) -> list[ProbeResult]:
     family, socktype, proto, destination = resolve_target(
         target, port, source_address
     )
     results = []
-    attempt = 0
-    for _repeat in range(repeats):
-        for offset in range(count):
-            if attempt and interval:
-                time.sleep(interval)
-            attempt += 1
-            results.append(
-                probe(
-                    attempt=attempt,
-                    source_port=source_port_start + offset,
-                    family=family,
-                    socktype=socktype,
-                    proto=proto,
-                    destination=destination,
-                    source_address=source_address,
-                    timeout=timeout,
-                )
-            )
+    for attempt in range(1, count * repeats + 1):
+        if attempt > 1 and interval:
+            time.sleep(interval)
+        result = probe(
+            attempt=attempt,
+            source_port=source_port_start + (attempt - 1) % count,
+            family=family,
+            socktype=socktype,
+            proto=proto,
+            destination=destination,
+            source_address=source_address,
+            timeout=timeout,
+        )
+        results.append(result)
+        if on_result:
+            on_result(result)
     return results
 
 
-def _parse_icmp_trace_reply(
-    packet: bytes,
-    source_port: int,
-    destination_port: int,
-    target_address: str,
-) -> tuple[str, bool] | None:
-    if len(packet) < 20:
-        return None
-    if packet[0] >> 4 != 4:
-        return None
-    outer_header_length = (packet[0] & 0x0F) * 4
-    if outer_header_length < 20 or len(packet) < outer_header_length + 8 + 20:
-        return None
-    if packet[9] != socket.IPPROTO_ICMP:
-        return None
-
-    icmp_offset = outer_header_length
-    icmp_type, icmp_code = packet[icmp_offset], packet[icmp_offset + 1]
-    if icmp_type not in (3, 11):
-        return None
-
-    quoted_offset = icmp_offset + 8
-    if packet[quoted_offset] >> 4 != 4:
-        return None
-    quoted_header_length = (packet[quoted_offset] & 0x0F) * 4
-    if (
-        quoted_header_length < 20
-        or len(packet) < quoted_offset + quoted_header_length + 4
-        or packet[quoted_offset + 9] != socket.IPPROTO_TCP
-        or packet[quoted_offset + 16:quoted_offset + 20]
-        != socket.inet_aton(target_address)
-    ):
-        return None
-    quoted_source_port, quoted_destination_port = struct.unpack_from(
-        "!HH", packet, quoted_offset + quoted_header_length
+def print_probe_result(target: str, port: int, result: ProbeResult) -> None:
+    line = (
+        f"{result.outcome.upper():9} {target}:{port} "
+        f"via source port {result.source_port} "
+        f"({result.elapsed_ms:.2f} ms)"
     )
-    if (
-        quoted_source_port != source_port
-        or quoted_destination_port != destination_port
-    ):
-        return None
-
-    responder = socket.inet_ntoa(packet[12:16])
-    terminal = icmp_type == 3
-    if terminal:
-        responder = f"{responder} (unreachable code {icmp_code})"
-    return responder, terminal
-
-
-def _parse_icmpv6_trace_reply(
-    packet: bytes,
-    responder: str,
-    source_port: int,
-    destination_port: int,
-    target_address: str,
-) -> tuple[str, bool] | None:
-    quoted_offset = 8
-    if len(packet) < quoted_offset + 40 + 4 or packet[0] not in (1, 3):
-        return None
-    quoted = packet[quoted_offset:]
-    if (
-        quoted[0] >> 4 != 6
-        or quoted[6] != socket.IPPROTO_TCP
-        or quoted[24:40] != socket.inet_pton(socket.AF_INET6, target_address)
-    ):
-        return None
-    quoted_source_port, quoted_destination_port = struct.unpack_from(
-        "!HH", quoted, 40
-    )
-    if (
-        quoted_source_port != source_port
-        or quoted_destination_port != destination_port
-    ):
-        return None
-    terminal = packet[0] == 1
-    if terminal:
-        responder = f"{responder} (unreachable code {packet[1]})"
-    return responder, terminal
-
-
-def _run_tcp_trace(
-    target: str,
-    destination_port: int,
-    source_port: int,
-    source_address: str | None,
-    timeout: float,
-) -> PathTrace:
-    try:
-        target_ip = ipaddress.ip_address(target)
-    except ValueError:
-        try:
-            source_ip = (
-                ipaddress.ip_address(source_address) if source_address else None
-            )
-            family = socket.AF_UNSPEC
-            if source_ip:
-                family = socket.AF_INET if source_ip.version == 4 else socket.AF_INET6
-            target_ip = ipaddress.ip_address(
-                socket.getaddrinfo(
-                    target, destination_port, family, socket.SOCK_STREAM
-                )[0][4][0]
-            )
-        except (OSError, IndexError, ValueError) as exc:
-            return PathTrace(
-                source_port=source_port,
-                error=f"could not resolve trace destination: {exc}",
-            )
-
-    family = socket.AF_INET if target_ip.version == 4 else socket.AF_INET6
-    raw_protocol = socket.IPPROTO_ICMP if target_ip.version == 4 else socket.IPPROTO_ICMPV6
-    ttl_option = socket.IP_TTL if target_ip.version == 4 else socket.IPV6_UNICAST_HOPS
-    wildcard = "0.0.0.0" if target_ip.version == 4 else "::"
-    try:
-        if source_address and ipaddress.ip_address(source_address).version != target_ip.version:
-            raise ValueError("source and destination address families differ")
-        icmp_socket = socket.socket(family, socket.SOCK_RAW, raw_protocol)
-    except (OSError, ValueError) as exc:
-        return PathTrace(
-            source_port=source_port,
-            error=(
-                "could not open the ICMP receive socket for the built-in trace "
-                f"(administrator/root privileges may be required): {exc}"
-            ),
-        )
-
-    hops = []
-    pending_connect_errors = {
-        errno.EINPROGRESS,
-        errno.EWOULDBLOCK,
-        errno.EALREADY,
-        errno.EINTR,
-        10035,  # WSAEWOULDBLOCK
-    }
-    with icmp_socket:
-        icmp_socket.setblocking(False)
-        for ttl in range(1, 31):
-            while True:
-                try:
-                    icmp_socket.recvfrom(4096)
-                except BlockingIOError:
-                    break
-            try:
-                with socket.socket(family, socket.SOCK_STREAM) as probe_socket:
-                    _configure_source_port_socket(probe_socket)
-                    level = socket.IPPROTO_IP if target_ip.version == 4 else socket.IPPROTO_IPV6
-                    probe_socket.setsockopt(level, ttl_option, ttl)
-                    probe_socket.setblocking(False)
-                    bind_address = source_address or wildcard
-                    bind_tuple = (
-                        (bind_address, source_port)
-                        if target_ip.version == 4
-                        else (bind_address, source_port, 0, 0)
-                    )
-                    destination = (
-                        (str(target_ip), destination_port)
-                        if target_ip.version == 4
-                        else (str(target_ip), destination_port, 0, 0)
-                    )
-                    probe_socket.bind(bind_tuple)
-                    connect_error = probe_socket.connect_ex(
-                        destination
-                    )
-                    if connect_error == 0 or connect_error == errno.ECONNREFUSED:
-                        hops.append(TraceHop(ttl, str(target_ip)))
-                        break
-                    if connect_error not in pending_connect_errors:
-                        return PathTrace(
-                            source_port=source_port,
-                            hops=hops,
-                            error=f"TCP trace probe failed at TTL {ttl}: "
-                            f"{os_error_text(connect_error)}",
-                        )
-
-                    deadline = time.monotonic() + timeout
-                    reached_destination = False
-                    while time.monotonic() < deadline:
-                        remaining = deadline - time.monotonic()
-                        readable, writable, _ = select.select(
-                            [icmp_socket], [probe_socket], [], remaining
-                        )
-                        if icmp_socket in readable:
-                            packet, address = icmp_socket.recvfrom(4096)
-                            if target_ip.version == 4:
-                                reply = _parse_icmp_trace_reply(
-                                    packet, source_port, destination_port, str(target_ip)
-                                )
-                            else:
-                                reply = _parse_icmpv6_trace_reply(
-                                    packet,
-                                    address[0],
-                                    source_port,
-                                    destination_port,
-                                    str(target_ip),
-                                )
-                            if reply:
-                                responder, terminal = reply
-                                hops.append(TraceHop(ttl, responder))
-                                reached_destination = terminal
-                                break
-                        if probe_socket in writable:
-                            socket_error = probe_socket.getsockopt(
-                                socket.SOL_SOCKET, socket.SO_ERROR
-                            )
-                            if socket_error in (0, errno.ECONNREFUSED, 10061):
-                                hops.append(TraceHop(ttl, str(target_ip)))
-                                reached_destination = True
-                                break
-                            if socket_error not in pending_connect_errors:
-                                break
-                    else:
-                        hops.append(TraceHop(ttl, "*"))
-                    if reached_destination:
-                        break
-            except OSError as exc:
-                return PathTrace(
-                    source_port=source_port,
-                    hops=hops,
-                    error=f"TCP trace probe failed at TTL {ttl}: {exc}",
-                )
-            if hops and hops[-1].ttl == ttl and (
-                hops[-1].response == str(target_ip)
-                or "unreachable code" in hops[-1].response
-            ):
-                break
-    if not hops:
-        return PathTrace(
-            source_port=source_port,
-            error="the built-in trace received no usable hop responses",
-        )
-    return PathTrace(source_port=source_port, hops=hops)
-
-
-def os_error_text(error_number: int) -> str:
-    try:
-        return OSError(error_number, "").strerror or f"socket error {error_number}"
-    except OSError:
-        return f"socket error {error_number}"
-
-
-def perform_secondary_diagnostics(
-    target: str,
-    destination_port: int,
-    results: Sequence[ProbeResult],
-    repeats: int,
-    source_address: str | None,
-    timeout: float,
-) -> PathDiagnosis:
-    """Compare TCP traceroutes only when repeated scans show stable outcomes."""
-    if repeats < 2:
-        return PathDiagnosis(
-            status="insufficient_evidence",
-            reason="at least two attempts per source port are required",
-            best_guess="No hop-level guess: repeat the scan to confirm the pattern.",
-        )
-
-    outcomes_by_port: dict[int, list[str]] = {}
-    for result in results:
-        outcomes_by_port.setdefault(result.source_port, []).append(result.outcome)
-
-    successful_ports = sorted(
-        source_port
-        for source_port, outcomes in outcomes_by_port.items()
-        if len(outcomes) == repeats and all(outcome == "connected" for outcome in outcomes)
-    )
-    failing_ports = sorted(
-        source_port
-        for source_port, outcomes in outcomes_by_port.items()
-        if len(outcomes) == repeats and all(outcome == "timeout" for outcome in outcomes)
-    )
-    if not successful_ports or not failing_ports:
-        return PathDiagnosis(
-            status="insufficient_evidence",
-            reason=(
-                "no source-port groups were consistently connected and "
-                "consistently timed out across all repeats"
-            ),
-            successful_source_ports=successful_ports,
-            failing_source_ports=failing_ports,
-            best_guess=(
-                "No hop-level guess: rerun with more repeats. Refused "
-                "connections and local socket errors are not treated as "
-                "evidence of a path-specific timeout."
-            ),
-        )
-
-    # One representative from each stable outcome limits probe volume.
-    traces = [
-        _run_tcp_trace(
-            target, destination_port, source_port, source_address, timeout
-        )
-        for source_port in (successful_ports[0], failing_ports[0])
-    ]
-    passing_trace, failing_trace = traces
-    if any(trace.error for trace in traces):
-        detail = "; ".join(
-            f"source port {trace.source_port}: {trace.error}"
-            for trace in traces if trace.error
-        )
-        return PathDiagnosis(
-            status="trace_unavailable",
-            reason=detail,
-            successful_source_ports=successful_ports,
-            failing_source_ports=failing_ports,
-            traces=traces,
-            best_guess=(
-                "No hop-level guess: TCP traces could not be compared. "
-                "Check traceroute availability, permissions, and platform support."
-            ),
-        )
-
-    passing_hops = {hop.ttl: hop.response for hop in passing_trace.hops}
-    failing_hops = {hop.ttl: hop.response for hop in failing_trace.hops}
-    common_ttls = sorted(passing_hops.keys() & failing_hops.keys())
-    divergence = next(
-        (
-            ttl for ttl in common_ttls
-            if passing_hops[ttl] != failing_hops[ttl]
-            and "*" not in passing_hops[ttl]
-            and "*" not in failing_hops[ttl]
-        ),
-        None,
-    )
-
-    if divergence is not None:
-        best_guess = (
-            f"The paths first show different responding hop(s) at TTL {divergence} "
-            f"(successful flow: {passing_hops[divergence]}; timed-out flow: "
-            f"{failing_hops[divergence]}). The differing ECMP branch or the "
-            "segment beyond it is a candidate, not a confirmed fault location."
-        )
-    else:
-        failing_responsive_ttls = [
-            hop.ttl for hop in failing_trace.hops
-            if hop.response.strip() != "*"
-        ]
-        passing_responsive_ttls = [
-            hop.ttl for hop in passing_trace.hops
-            if hop.response.strip() != "*"
-        ]
-        if (
-            failing_responsive_ttls
-            and passing_responsive_ttls
-            and max(failing_responsive_ttls) < max(passing_responsive_ttls)
-        ):
-            last_hop = max(failing_responsive_ttls)
-            next_hop = next(
-                (ttl for ttl in passing_responsive_ttls if ttl > last_hop),
-                None,
-            )
-            if next_hop is None:
-                best_guess = (
-                    f"The timed-out flow stops receiving hop replies after TTL "
-                    f"{last_hop} ({failing_hops[last_hop]}). The segment beyond "
-                    "that router is a candidate, but missing traceroute replies "
-                    "do not prove packet loss there."
-                )
-            else:
-                best_guess = (
-                    f"The timed-out flow stops receiving hop replies after TTL "
-                    f"{last_hop} ({failing_hops[last_hop]}), while the successful "
-                    f"flow responds again at TTL {next_hop} "
-                    f"({passing_hops[next_hop]}). Investigate that interval first; "
-                    "ICMP filtering or rate limiting can create the same pattern."
-                )
-        else:
-            best_guess = (
-                "No clear hop-level difference was visible. If the traces have "
-                "similar responding paths, the issue may be near the destination "
-                "or on the return path; traceroute cannot distinguish these reliably."
-            )
-
-    return PathDiagnosis(
-        status="compared",
-        reason=(
-            f"compared TCP traces from successful source port "
-            f"{passing_trace.source_port} and timed-out source port "
-            f"{failing_trace.source_port}"
-        ),
-        successful_source_ports=successful_ports,
-        failing_source_ports=failing_ports,
-        traces=traces,
-        best_guess=best_guess,
-    )
+    if result.error:
+        line += f" - {result.error}"
+    print(line, flush=True)
 
 
 def print_text_summary(
-    target: str, port: int, results: Sequence[ProbeResult]
+    target: str,
+    port: int,
+    results: Sequence[ProbeResult],
+    print_probes: bool = True,
 ) -> None:
-    for result in results:
-        line = (
-            f"{result.outcome.upper():9} {target}:{port} "
-            f"via source port {result.source_port} "
-            f"({result.elapsed_ms:.2f} ms)"
-        )
-        if result.error:
-            line += f" - {result.error}"
-        print(line)
+    if print_probes:
+        for result in results:
+            print_probe_result(target, port, result)
 
     counts = {
         outcome: sum(result.outcome == outcome for result in results)
@@ -672,25 +263,15 @@ def print_text_summary(
             notes.append(
                 "ERROR probes were inconclusive; see their per-probe error text."
             )
+        if counts["connected"] and counts["timeout"] + counts["refused"] > 1:
+            notes.append(
+                "Mixed successful and failed probes may indicate an ECMP-related "
+                "issue, but do not prove one. Repeat the scan and check whether "
+                "the same source ports fail consistently; that pattern would make "
+                "ECMP more likely."
+            )
         interpretation = " ".join(notes)
     print(f"Interpretation: {interpretation}")
-
-
-def print_diagnosis(diagnosis: PathDiagnosis) -> None:
-    print(f"\nSecondary diagnostics: {diagnosis.status}")
-    print(diagnosis.reason)
-    for trace in diagnosis.traces:
-        print(f"\nTCP traceroute using source port {trace.source_port}:")
-        if trace.error:
-            print(f"  unavailable: {trace.error}")
-        else:
-            for hop in trace.hops:
-                print(f"  {hop.ttl:2}  {hop.response}")
-    print(f"\nBest guess: {diagnosis.best_guess}")
-    print(
-        "Traceroute replies may be filtered, rate-limited, or return via a "
-        "different path; treat this as a lead, not a fault location."
-    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -707,21 +288,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout=args.timeout,
             interval=args.interval,
             repeats=args.repeats,
+            on_result=(
+                None
+                if args.json_output
+                else lambda result: print_probe_result(
+                    args.target, args.port, result
+                )
+            ),
         )
     except (OSError, ValueError) as exc:
         print(f"ecmp-scan: {exc}", file=sys.stderr)
         return 2
-
-    diagnosis = None
-    if args.trace_diagnostics:
-        diagnosis = perform_secondary_diagnostics(
-            target=args.target,
-            destination_port=args.port,
-            results=results,
-            repeats=args.repeats,
-            source_address=args.source_address,
-            timeout=args.timeout,
-        )
 
     if args.json_output:
         output = {
@@ -729,13 +306,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "destination_port": args.port,
             "results": [asdict(result) for result in results],
         }
-        if diagnosis:
-            output["secondary_diagnostics"] = asdict(diagnosis)
         print(json.dumps(output, indent=2))
     else:
-        print_text_summary(args.target, args.port, results)
-        if diagnosis:
-            print_diagnosis(diagnosis)
+        print_text_summary(args.target, args.port, results, print_probes=False)
     return 0
 
 
