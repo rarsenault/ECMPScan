@@ -188,7 +188,7 @@ class TextSummaryTests(unittest.TestCase):
         output = StringIO()
 
         with redirect_stdout(output):
-            ecmp_scan.print_text_summary("192.0.2.10", 443, results)
+            ecmp_scan.print_text_summary(results)
 
         self.assertIn(
             "Interpretation: All probes connected; no failures were observed.",
@@ -207,7 +207,7 @@ class TextSummaryTests(unittest.TestCase):
         output = StringIO()
 
         with redirect_stdout(output):
-            ecmp_scan.print_text_summary("192.0.2.10", 443, results)
+            ecmp_scan.print_text_summary(results)
 
         interpretation = output.getvalue().split("Interpretation: ", 1)[1]
         self.assertIn("1 probe timed out", interpretation)
@@ -225,7 +225,7 @@ class TextSummaryTests(unittest.TestCase):
         output = StringIO()
 
         with redirect_stdout(output):
-            ecmp_scan.print_text_summary("192.0.2.10", 443, results)
+            ecmp_scan.print_text_summary(results)
 
         interpretation = output.getvalue().split("Interpretation: ", 1)[1]
         self.assertIn("may indicate an ECMP-related issue, but do not prove one", interpretation)

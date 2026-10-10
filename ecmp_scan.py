@@ -6,12 +6,11 @@ from __future__ import annotations
 import argparse
 import errno
 import ipaddress
-import json
 import socket
 import struct
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Callable, Sequence
 
 
@@ -60,10 +59,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repeats", type=int, default=1,
         help="repeat the complete source-port range (default: 1)",
-    )
-    parser.add_argument(
-        "--json", action="store_true", dest="json_output",
-        help="print machine-readable JSON instead of a text summary",
     )
     return parser
 
@@ -215,16 +210,7 @@ def print_probe_result(target: str, port: int, result: ProbeResult) -> None:
     print(line, flush=True)
 
 
-def print_text_summary(
-    target: str,
-    port: int,
-    results: Sequence[ProbeResult],
-    print_probes: bool = True,
-) -> None:
-    if print_probes:
-        for result in results:
-            print_probe_result(target, port, result)
-
+def print_text_summary(results: Sequence[ProbeResult]) -> None:
     counts = {
         outcome: sum(result.outcome == outcome for result in results)
         for outcome in ("connected", "timeout", "refused", "source-port-busy", "error")
@@ -288,27 +274,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout=args.timeout,
             interval=args.interval,
             repeats=args.repeats,
-            on_result=(
-                None
-                if args.json_output
-                else lambda result: print_probe_result(
-                    args.target, args.port, result
-                )
+            on_result=lambda result: print_probe_result(
+                args.target, args.port, result
             ),
         )
     except (OSError, ValueError) as exc:
         print(f"ecmp-scan: {exc}", file=sys.stderr)
         return 2
 
-    if args.json_output:
-        output = {
-            "target": args.target,
-            "destination_port": args.port,
-            "results": [asdict(result) for result in results],
-        }
-        print(json.dumps(output, indent=2))
-    else:
-        print_text_summary(args.target, args.port, results, print_probes=False)
+    print_text_summary(results)
     return 0
 
 
