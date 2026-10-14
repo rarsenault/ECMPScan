@@ -240,7 +240,7 @@ def pattern_notes(by_port: dict[int, Counter]) -> list[str]:
         notes.append(
             f"{_port_list(intermittent).capitalize()} failed only some of the "
             "time. Failures that move between attempts point more toward packet "
-            "loss or congestion than a fixed path."
+            "loss or congestion than a faulted ECMP path."
         )
     return notes
 
