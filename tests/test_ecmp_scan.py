@@ -1,236 +1,221 @@
 import socket
-import struct
-import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, contextmanager, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
 import ecmp_scan
 
+LOOPBACK = "127.0.0.1"
 
-class PortRangeTests(unittest.TestCase):
-    def test_resolve_target_matches_source_address_family(self):
-        addresses = [
-            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 80, 0, 0)),
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80)),
-        ]
-        with patch.object(socket, "getaddrinfo", return_value=addresses):
-            result = ecmp_scan.resolve_target("localhost", 80, "127.0.0.1")
 
-        self.assertEqual(
-            result,
-            (socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", 80)),
-        )
+def result(outcome, attempt=1, port=45000, error=None):
+    return ecmp_scan.ProbeResult(attempt, port, outcome, 1.0, error)
 
-    def test_windows_uses_abortive_close_for_fixed_source_ports(self):
-        connection = unittest.mock.Mock()
-        with patch.object(ecmp_scan.sys, "platform", "win32"):
-            ecmp_scan._configure_source_port_socket(connection)
 
-        connection.setsockopt.assert_called_once_with(
-            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("HH", 1, 0)
-        )
+def free_port():
+    with closing(socket.socket()) as sock:
+        sock.bind((LOOPBACK, 0))
+        return sock.getsockname()[1]
 
-    def test_reuseaddr_is_limited_to_non_windows(self):
-        connection = unittest.mock.Mock()
-        with patch.object(ecmp_scan.sys, "platform", "linux"):
-            ecmp_scan._configure_source_port_socket(connection)
 
-        connection.setsockopt.assert_called_once_with(
-            socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
-        )
+@contextmanager
+def listener():
+    """A listening socket; the kernel completes handshakes without accept()."""
+    with closing(socket.socket()) as server:
+        server.bind((LOOPBACK, 0))
+        server.listen()
+        yield server.getsockname()[1]
+
+
+def probe_local(destination_port, source_port, attempt=1):
+    return ecmp_scan.probe(
+        attempt, source_port, socket.AF_INET, (LOOPBACK, destination_port),
+        LOOPBACK, 1.0,
+    )
+
+
+class ResolveTargetTests(unittest.TestCase):
+    def resolve(self, source_address):
+        records = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (LOOPBACK, 80))]
+        with patch.object(socket, "getaddrinfo", return_value=records) as getaddrinfo:
+            resolved = ecmp_scan.resolve_target("localhost", 80, source_address)
+        return resolved, getaddrinfo.call_args.kwargs["family"]
+
+    def test_source_address_restricts_address_family(self):
+        self.assertEqual(self.resolve("127.0.0.1")[1], socket.AF_INET)
+        self.assertEqual(self.resolve("::1")[1], socket.AF_INET6)
+
+    def test_no_source_address_allows_any_family(self):
+        resolved, family = self.resolve(None)
+        self.assertEqual(family, socket.AF_UNSPEC)
+        self.assertEqual(resolved, (socket.AF_INET, (LOOPBACK, 80)))
+
+
+class ScanTests(unittest.TestCase):
+    def run_scan(self, count, repeats=1, on_result=None, events=None):
+        def fake_probe(**kwargs):
+            if events is not None:
+                events.append(("probe", kwargs["attempt"]))
+            return result("connected", kwargs["attempt"], kwargs["source_port"])
+
+        with patch.object(
+            ecmp_scan, "resolve_target",
+            return_value=(socket.AF_INET, (LOOPBACK, 80)),
+        ), patch.object(ecmp_scan, "probe", side_effect=fake_probe):
+            return ecmp_scan.scan(
+                LOOPBACK, 80, count=count, source_port_start=45000,
+                source_address=None, timeout=1.0, interval=0,
+                repeats=repeats, on_result=on_result,
+            )
 
     def test_sequential_source_ports(self):
-        with patch.object(ecmp_scan, "resolve_target", return_value=(
-            socket.AF_INET, socket.SOCK_STREAM, 0, ("127.0.0.1", 80)
-        )), patch.object(ecmp_scan, "probe", side_effect=lambda **kwargs:
-            ecmp_scan.ProbeResult(
-                kwargs["attempt"], kwargs["source_port"], "connected", 1.0
-            )
-        ):
-            results = ecmp_scan.scan(
-                "127.0.0.1", 80, 3, 45000, None, 1.0, 0
-            )
-
-        self.assertEqual([result.source_port for result in results], [
-            45000, 45001, 45002
-        ])
+        ports = [r.source_port for r in self.run_scan(3)]
+        self.assertEqual(ports, [45000, 45001, 45002])
 
     def test_repeats_each_source_port(self):
-        with patch.object(ecmp_scan, "resolve_target", return_value=(
-            socket.AF_INET, socket.SOCK_STREAM, 0, ("127.0.0.1", 80)
-        )), patch.object(ecmp_scan, "probe", side_effect=lambda **kwargs:
-            ecmp_scan.ProbeResult(
-                kwargs["attempt"], kwargs["source_port"], "connected", 1.0
-            )
-        ):
-            results = ecmp_scan.scan(
-                "127.0.0.1", 80, 2, 45000, None, 1.0, 0, repeats=2
-            )
+        ports = [r.source_port for r in self.run_scan(2, repeats=2)]
+        self.assertEqual(ports, [45000, 45001, 45000, 45001])
 
+    def test_each_result_is_reported_before_the_next_probe(self):
+        events = []
+        self.run_scan(
+            2, events=events,
+            on_result=lambda r: events.append(("reported", r.attempt)),
+        )
         self.assertEqual(
-            [result.source_port for result in results],
-            [45000, 45001, 45000, 45001],
+            events,
+            [("probe", 1), ("reported", 1), ("probe", 2), ("reported", 2)],
         )
 
-    def test_scan_reports_each_result_before_starting_the_next_probe(self):
-        events = []
 
-        def run_probe(**kwargs):
-            events.append(("probe", kwargs["attempt"]))
-            return ecmp_scan.ProbeResult(
-                kwargs["attempt"], kwargs["source_port"], "connected", 1.0
-            )
+class LocalProbeTests(unittest.TestCase):
+    def test_connects_to_local_listener(self):
+        with listener() as port:
+            self.assertEqual(probe_local(port, free_port()).outcome, "connected")
 
-        with patch.object(ecmp_scan, "resolve_target", return_value=(
-            socket.AF_INET, socket.SOCK_STREAM, 0, ("127.0.0.1", 80)
-        )), patch.object(ecmp_scan, "probe", side_effect=run_probe):
-            ecmp_scan.scan(
-                "127.0.0.1", 80, 2, 45000, None, 1.0, 0,
-                on_result=lambda result: events.append(("reported", result.attempt)),
-            )
+    def test_source_port_can_be_reused_immediately(self):
+        source_port = free_port()
+        with listener() as port:
+            outcomes = [probe_local(port, source_port, n).outcome for n in (1, 2, 3)]
+        self.assertEqual(outcomes, ["connected"] * 3)
 
-        self.assertEqual(events, [
-            ("probe", 1), ("reported", 1),
-            ("probe", 2), ("reported", 2),
-        ])
+    def test_closed_destination_port_is_refused(self):
+        self.assertEqual(probe_local(free_port(), free_port()).outcome, "refused")
 
+    def test_busy_source_port_is_reported_as_local_conflict(self):
+        with listener() as port, closing(socket.socket()) as holder:
+            holder.bind((LOOPBACK, 0))
+            probe_result = probe_local(port, holder.getsockname()[1])
+        self.assertEqual(probe_result.outcome, "source-port-busy")
+        self.assertIn("local bind conflict", probe_result.error)
 
-class LocalConnectionTests(unittest.TestCase):
-    def test_probe_connects_to_local_tcp_listener(self):
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.bind(("127.0.0.1", 0))
-        listener.listen()
-        destination_port = listener.getsockname()[1]
-        accepted = threading.Event()
-
-        def accept_one():
-            connection, _ = listener.accept()
-            connection.close()
-            accepted.set()
-
-        worker = threading.Thread(target=accept_one, daemon=True)
-        worker.start()
-        source_port = self._available_source_port()
-        try:
-            result = ecmp_scan.probe(
-                attempt=1,
-                source_port=source_port,
-                family=socket.AF_INET,
-                socktype=socket.SOCK_STREAM,
-                proto=0,
-                destination=("127.0.0.1", destination_port),
-                source_address="127.0.0.1",
-                timeout=1.0,
-            )
-        finally:
-            listener.close()
-            worker.join(timeout=1)
-
-        self.assertEqual(result.outcome, "connected")
-        self.assertTrue(accepted.is_set())
-
-    def test_probe_can_reuse_source_port_after_successful_connection(self):
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.bind(("127.0.0.1", 0))
-        listener.listen()
-        destination = ("127.0.0.1", listener.getsockname()[1])
-        accepted_count = []
-
-        def accept_two():
-            for _ in range(2):
-                connection, _ = listener.accept()
-                accepted_count.append(True)
-                connection.close()
-
-        worker = threading.Thread(target=accept_two, daemon=True)
-        worker.start()
-        source_port = self._available_source_port()
-        try:
-            results = [
-                ecmp_scan.probe(
-                    attempt=attempt,
-                    source_port=source_port,
-                    family=socket.AF_INET,
-                    socktype=socket.SOCK_STREAM,
-                    proto=0,
-                    destination=destination,
-                    source_address="127.0.0.1",
-                    timeout=1.0,
-                )
-                for attempt in (1, 2)
-            ]
-        finally:
-            listener.close()
-            worker.join(timeout=1)
-
-        self.assertEqual([result.outcome for result in results], [
-            "connected", "connected"
-        ])
-        self.assertEqual(len(accepted_count), 2)
-
-    @staticmethod
-    def _available_source_port():
-        reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
-        reservation.close()
-        return port
+    def test_timeout_is_classified(self):
+        with patch.object(socket.socket, "connect", side_effect=TimeoutError):
+            probe_result = probe_local(80, free_port())
+        self.assertEqual(probe_result.outcome, "timeout")
+        self.assertEqual(probe_result.error, "connection timed out")
 
 
 class TextSummaryTests(unittest.TestCase):
-    def test_all_connected_summary_has_no_failure_guidance(self):
-        results = [
-            ecmp_scan.ProbeResult(1, 45000, "connected", 20),
-            ecmp_scan.ProbeResult(2, 45001, "connected", 21),
-        ]
+    def interpretation(self, *outcomes):
+        results = [result(o, i, 45000 + i) for i, o in enumerate(outcomes, 1)]
         output = StringIO()
-
         with redirect_stdout(output):
             ecmp_scan.print_text_summary(results)
+        return output.getvalue().split("Interpretation: ", 1)[1]
 
+    def test_all_connected_summary_has_no_failure_guidance(self):
+        self.assertEqual(
+            self.interpretation("connected", "connected").strip(),
+            "All probes connected; no failures were observed.",
+        )
+
+    def test_summary_counts_every_outcome(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            ecmp_scan.print_text_summary([result("connected"), result("timeout")])
         self.assertIn(
-            "Interpretation: All probes connected; no failures were observed.",
+            "Summary: connected=1, timeout=1, refused=0, source-port-busy=0, error=0",
             output.getvalue(),
         )
-        self.assertNotIn("Repeated timeouts", output.getvalue())
 
     def test_summary_interprets_only_outcomes_that_occurred(self):
-        results = [
-            ecmp_scan.ProbeResult(1, 45000, "timeout", 1000),
-            ecmp_scan.ProbeResult(2, 45001, "connected", 20),
-            ecmp_scan.ProbeResult(
-                3, 45002, "source-port-busy", 0.1, "local bind conflict"
-            ),
-        ]
-        output = StringIO()
-
-        with redirect_stdout(output):
-            ecmp_scan.print_text_summary(results)
-
-        interpretation = output.getvalue().split("Interpretation: ", 1)[1]
-        self.assertIn("1 probe timed out", interpretation)
-        self.assertIn("Repeating the scan can show", interpretation)
-        self.assertIn("SOURCE-PORT-BUSY is a local bind conflict", interpretation)
-        self.assertNotIn("Refused probes", interpretation)
-        self.assertNotIn("ERROR probes", interpretation)
+        text = self.interpretation("timeout", "connected", "source-port-busy")
+        self.assertIn("1 probe timed out", text)
+        self.assertIn("Repeating the scan can show", text)
+        self.assertIn("SOURCE-PORT-BUSY is a local bind conflict", text)
+        self.assertNotIn("Refused probes", text)
+        self.assertNotIn("ERROR probes", text)
+        self.assertNotIn("Mixed successful", text)
 
     def test_mixed_multiple_failures_suggest_checking_source_port_consistency(self):
+        text = self.interpretation("connected", "timeout", "refused")
+        self.assertIn("may indicate an ECMP-related issue, but do not prove one", text)
+        self.assertIn("same source ports fail consistently", text)
+        self.assertIn("would make ECMP more likely", text)
+
+
+class PerPortSummaryTests(unittest.TestCase):
+    @staticmethod
+    def summarize(*per_port):
+        """per_port: (source_port, outcomes...) tuples, one entry per port."""
         results = [
-            ecmp_scan.ProbeResult(1, 45000, "connected", 20),
-            ecmp_scan.ProbeResult(2, 45001, "timeout", 1000),
-            ecmp_scan.ProbeResult(3, 45002, "refused", 5),
+            result(outcome, port=port)
+            for attempt in range(max(len(p) - 1 for p in per_port))
+            for port, *outcomes in per_port
+            for outcome in outcomes[attempt:attempt + 1]
         ]
         output = StringIO()
-
         with redirect_stdout(output):
             ecmp_scan.print_text_summary(results)
+        return output.getvalue()
 
-        interpretation = output.getvalue().split("Interpretation: ", 1)[1]
-        self.assertIn("may indicate an ECMP-related issue, but do not prove one", interpretation)
-        self.assertIn("same source ports fail consistently", interpretation)
-        self.assertIn("would make ECMP more likely", interpretation)
+    def test_consistently_failing_port_is_listed_and_flagged(self):
+        text = self.summarize(
+            (45000, "connected", "connected", "connected"),
+            (45001, "timeout", "timeout", "timeout"),
+        )
+        self.assertIn("45001: 3/3 (timeout=3) consistent", text)
+        self.assertNotIn("45000:", text)
+        self.assertIn("Source port 45001 failed on every attempt", text)
+        self.assertIn("1 other source port connected without failures", text)
+        self.assertIn("would make ECMP more likely", text)
+        self.assertNotIn("Repeating the scan", text)
+        self.assertNotIn("Mixed successful", text)
+
+    def test_intermittent_failures_point_away_from_a_fixed_path(self):
+        text = self.summarize(
+            (45000, "timeout", "connected", "connected"),
+            (45001, "connected", "connected", "refused"),
+        )
+        self.assertIn("45000: 1/3 (timeout=1) intermittent", text)
+        self.assertIn("45001: 1/3 (refused=1) intermittent", text)
+        self.assertIn("Source ports 45000, 45001 failed only some of the time", text)
+        self.assertIn("loss or congestion", text)
+        self.assertNotIn("failed on every attempt", text)
+
+    def test_all_ports_failing_is_not_source_port_specific(self):
+        text = self.summarize(
+            (45000, "timeout", "timeout"),
+            (45001, "timeout", "timeout"),
+        )
+        self.assertIn("does not look specific to particular source ports", text)
+        self.assertNotIn("would make ECMP more likely", text)
+
+    def test_single_pass_has_no_per_port_section(self):
+        text = self.summarize(
+            (45000, "connected"), (45001, "timeout"), (45002, "refused"),
+        )
+        self.assertNotIn("Source ports with failures", text)
+        self.assertIn("Mixed successful and failed probes", text)
+
+    def test_local_problems_are_not_counted_as_port_failures(self):
+        text = self.summarize(
+            (45000, "connected", "connected"),
+            (45001, "source-port-busy", "error"),
+        )
+        self.assertNotIn("Source ports with failures", text)
 
 
 if __name__ == "__main__":

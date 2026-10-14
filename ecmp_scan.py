@@ -10,8 +10,18 @@ import socket
 import struct
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Sequence
+
+OUTCOMES = ("connected", "timeout", "refused", "source-port-busy", "error")
+# Outcomes that mean the network path failed (as opposed to a local problem).
+FAILURES = ("timeout", "refused")
+
+# Close with a TCP reset so a fixed source port is never left in TIME_WAIT and
+# can be reused by a later repeat. Windows' struct linger is two u_shorts;
+# POSIX systems use two ints.
+_ABORTIVE_CLOSE = struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0)
 
 
 @dataclass(frozen=True)
@@ -87,80 +97,54 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
 def resolve_target(
     target: str, port: int, source_address: str | None
-) -> tuple[int, int, int, tuple]:
-    source_ip = ipaddress.ip_address(source_address) if source_address else None
-    source_family = (
-        {4: socket.AF_INET, 6: socket.AF_INET6}[source_ip.version]
-        if source_ip
-        else None
-    )
-    records = socket.getaddrinfo(
-        target, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
-    )
-    for family, socktype, proto, _canonical_name, sockaddr in records:
-        if source_family is None or family == source_family:
-            return family, socktype, proto, sockaddr
-    raise ValueError(
-        f"no address for {target!r} matches source address {source_address!r}"
-    )
-
-
-def _configure_source_port_socket(connection: socket.socket) -> None:
-    if sys.platform == "win32":
-        # An abortive close avoids Windows retaining this fixed tuple in TIME_WAIT.
-        connection.setsockopt(
-            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("HH", 1, 0)
-        )
-    else:
-        connection.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+) -> tuple[int, tuple]:
+    """Return (address family, sockaddr), restricted to the source address's family."""
+    family = socket.AF_UNSPEC
+    if source_address:
+        version = ipaddress.ip_address(source_address).version
+        family = socket.AF_INET6 if version == 6 else socket.AF_INET
+    # Raises socket.gaierror (an OSError) if nothing matches.
+    family, _, _, _, sockaddr = socket.getaddrinfo(
+        target, port, family=family, type=socket.SOCK_STREAM
+    )[0]
+    return family, sockaddr
 
 
 def probe(
     attempt: int,
     source_port: int,
     family: int,
-    socktype: int,
-    proto: int,
     destination: tuple,
     source_address: str | None,
     timeout: float,
 ) -> ProbeResult:
-    started = time.monotonic()
+    wildcard = "::" if family == socket.AF_INET6 else "0.0.0.0"
+    outcome, error = "connected", None
+    started = time.perf_counter()
     try:
-        with socket.socket(family, socktype, proto) as connection:
-            _configure_source_port_socket(connection)
+        with socket.socket(family, socket.SOCK_STREAM) as connection:
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _ABORTIVE_CLOSE)
             connection.settimeout(timeout)
-            if family == socket.AF_INET6:
-                bind_address = source_address or "::"
-                connection.bind((bind_address, source_port, 0, 0))
-            else:
-                bind_address = source_address or "0.0.0.0"
-                connection.bind((bind_address, source_port))
+            connection.bind((source_address or wildcard, source_port))
             connection.connect(destination)
-        outcome = "connected"
-        error = None
-    except (socket.timeout, TimeoutError) as exc:
-        outcome = "timeout"
-        error = str(exc) or "connection timed out"
+    except TimeoutError as exc:
+        outcome, error = "timeout", str(exc) or "connection timed out"
+    except ConnectionRefusedError as exc:
+        outcome, error = "refused", str(exc)
     except OSError as exc:
-        error = str(exc)
-        error_code = getattr(exc, "winerror", None) or exc.errno
-        if error_code in (errno.ECONNREFUSED, 10061):
-            outcome = "refused"
-        elif error_code in (errno.EADDRINUSE, 10048):
+        if exc.errno == errno.EADDRINUSE:
             outcome = "source-port-busy"
             error = (
-                f"local source port {source_port} is already in use or in "
-                f"TCP TIME_WAIT; this is a local bind conflict, not a "
-                f"destination failure ({exc})"
+                f"local source port {source_port} is already in use; this is a "
+                f"local bind conflict, not a destination failure ({exc})"
             )
         else:
-            outcome = "error"
+            outcome, error = "error", str(exc)
     return ProbeResult(
         attempt=attempt,
         source_port=source_port,
         outcome=outcome,
-        elapsed_ms=round((time.monotonic() - started) * 1000, 2),
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
         error=error,
     )
 
@@ -168,6 +152,7 @@ def probe(
 def scan(
     target: str,
     port: int,
+    *,
     count: int,
     source_port_start: int,
     source_address: str | None,
@@ -176,19 +161,15 @@ def scan(
     repeats: int = 1,
     on_result: Callable[[ProbeResult], None] | None = None,
 ) -> list[ProbeResult]:
-    family, socktype, proto, destination = resolve_target(
-        target, port, source_address
-    )
+    family, destination = resolve_target(target, port, source_address)
     results = []
     for attempt in range(1, count * repeats + 1):
-        if attempt > 1 and interval:
+        if attempt > 1:
             time.sleep(interval)
         result = probe(
             attempt=attempt,
             source_port=source_port_start + (attempt - 1) % count,
             family=family,
-            socktype=socktype,
-            proto=proto,
             destination=destination,
             source_address=source_address,
             timeout=timeout,
@@ -210,54 +191,130 @@ def print_probe_result(target: str, port: int, result: ProbeResult) -> None:
     print(line, flush=True)
 
 
-def print_text_summary(results: Sequence[ProbeResult]) -> None:
-    counts = {
-        outcome: sum(result.outcome == outcome for result in results)
-        for outcome in ("connected", "timeout", "refused", "source-port-busy", "error")
-    }
-    print(
-        "\nSummary: "
-        + ", ".join(f"{outcome}={count}" for outcome, count in counts.items())
-    )
+def port_outcomes(results: Sequence[ProbeResult]) -> dict[int, Counter]:
+    """Group outcome counts by source port."""
+    by_port: dict[int, Counter] = {}
+    for result in results:
+        by_port.setdefault(result.source_port, Counter())[result.outcome] += 1
+    return by_port
+
+
+def _failed(outcomes: Counter) -> int:
+    return sum(outcomes[o] for o in FAILURES)
+
+
+def _classify_ports(by_port: dict[int, Counter]) -> tuple[list, list, list]:
+    """Split ports into (consistently failing, intermittent, failure-free)."""
+    consistent = [
+        p for p, c in by_port.items() if _failed(c) >= 2 and not c["connected"]
+    ]
+    intermittent = [p for p, c in by_port.items() if _failed(c) and c["connected"]]
+    healthy = [p for p, c in by_port.items() if c["connected"] and not _failed(c)]
+    return consistent, intermittent, healthy
+
+
+def _port_list(ports: Sequence[int]) -> str:
+    plural = "s" if len(ports) > 1 else ""
+    return f"source port{plural} " + ", ".join(map(str, ports))
+
+
+def pattern_notes(by_port: dict[int, Counter]) -> list[str]:
+    """Interpret failures by source port; needs each port probed more than once."""
+    consistent, intermittent, healthy = _classify_ports(by_port)
+    notes = []
+    if consistent and healthy:
+        notes.append(
+            f"{_port_list(consistent).capitalize()} failed on every attempt "
+            f"while {len(healthy)} other source "
+            f"port{'s' if len(healthy) > 1 else ''} connected without failures. "
+            "That pattern would make ECMP more likely, but it does not prove "
+            "it or locate the fault."
+        )
+    elif consistent:
+        notes.append(
+            "No source port connected without failures, so the problem does not "
+            "look specific to particular source ports. Check the destination "
+            "service, firewalls, or a path-wide problem before suspecting ECMP."
+        )
+    if intermittent:
+        notes.append(
+            f"{_port_list(intermittent).capitalize()} failed only some of the "
+            "time. Failures that move between attempts point more toward packet "
+            "loss or congestion than a fixed path."
+        )
+    return notes
+
+
+def interpret(results: Sequence[ProbeResult]) -> str:
+    """Explain only the outcomes that actually occurred."""
+    counts = Counter(result.outcome for result in results)
     if not results:
-        interpretation = "No probes were run."
-    elif counts["connected"] == len(results):
-        interpretation = "All probes connected; no failures were observed."
-    else:
-        notes = []
-        if counts["timeout"]:
-            timeout_label = (
-                "probe timed out" if counts["timeout"] == 1 else "probes timed out"
+        return "No probes were run."
+    if counts["connected"] == len(results):
+        return "All probes connected; no failures were observed."
+    by_port = port_outcomes(results)
+    repeated = _is_repeated(by_port)
+    notes = []
+    if n := counts["timeout"]:
+        notes.append(
+            f"{n} probe{'s' if n > 1 else ''} timed out; the TCP handshake did "
+            "not complete before the timeout."
+            + (
+                ""
+                if repeated
+                else " Repeating the scan can show whether timeouts "
+                "consistently affect particular source ports, but this alone "
+                "does not prove ECMP or locate a fault."
             )
-            notes.append(
-                f"{counts['timeout']} {timeout_label}; the TCP handshake did not "
-                "complete before the timeout. Repeating the scan can show whether "
-                "timeouts consistently affect particular source ports, but this "
-                "alone does not prove ECMP or locate a fault."
-            )
-        if counts["refused"]:
-            notes.append(
-                "Refused probes were actively rejected; they are not successful "
-                "handshakes."
-            )
-        if counts["source-port-busy"]:
-            notes.append(
-                "SOURCE-PORT-BUSY is a local bind conflict; no network probe "
-                "was made for those attempts."
-            )
-        if counts["error"]:
-            notes.append(
-                "ERROR probes were inconclusive; see their per-probe error text."
-            )
-        if counts["connected"] and counts["timeout"] + counts["refused"] > 1:
-            notes.append(
-                "Mixed successful and failed probes may indicate an ECMP-related "
-                "issue, but do not prove one. Repeat the scan and check whether "
-                "the same source ports fail consistently; that pattern would make "
-                "ECMP more likely."
-            )
-        interpretation = " ".join(notes)
-    print(f"Interpretation: {interpretation}")
+        )
+    if counts["refused"]:
+        notes.append(
+            "Refused probes were actively rejected; they are not successful "
+            "handshakes."
+        )
+    if counts["source-port-busy"]:
+        notes.append(
+            "SOURCE-PORT-BUSY is a local bind conflict; no network probe "
+            "was made for those attempts."
+        )
+    if counts["error"]:
+        notes.append("ERROR probes were inconclusive; see their per-probe error text.")
+    if repeated:
+        notes.extend(pattern_notes(by_port))
+    elif counts["connected"] and _failed(counts) > 1:
+        notes.append(
+            "Mixed successful and failed probes may indicate an ECMP-related "
+            "issue, but do not prove one. Repeat the scan and check whether "
+            "the same source ports fail consistently; that pattern would make "
+            "ECMP more likely."
+        )
+    return " ".join(notes)
+
+
+def _is_repeated(by_port: dict[int, Counter]) -> bool:
+    return any(sum(c.values()) > 1 for c in by_port.values())
+
+
+def print_port_failures(by_port: dict[int, Counter]) -> None:
+    """List source ports with failures, when ports were probed repeatedly."""
+    consistent, _, _ = _classify_ports(by_port)
+    failing = sorted(p for p, c in by_port.items() if _failed(c))
+    if not _is_repeated(by_port) or not failing:
+        return
+    print("\nSource ports with failures (failed/attempts):")
+    for port in failing:
+        outcomes = by_port[port]
+        details = ", ".join(f"{o}={outcomes[o]}" for o in FAILURES if outcomes[o])
+        kind = "consistent" if port in consistent else "intermittent"
+        print(f"  {port}: {_failed(outcomes)}/{sum(outcomes.values())} "
+              f"({details}) {kind}")
+
+
+def print_text_summary(results: Sequence[ProbeResult]) -> None:
+    counts = Counter(result.outcome for result in results)
+    print("\nSummary: " + ", ".join(f"{o}={counts[o]}" for o in OUTCOMES))
+    print_port_failures(port_outcomes(results))
+    print(f"\nInterpretation: {interpret(results)}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -266,17 +323,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate_args(parser, args)
     try:
         results = scan(
-            target=args.target,
-            port=args.port,
+            args.target,
+            args.port,
             count=args.count,
             source_port_start=args.source_port_start,
             source_address=args.source_address,
             timeout=args.timeout,
             interval=args.interval,
             repeats=args.repeats,
-            on_result=lambda result: print_probe_result(
-                args.target, args.port, result
-            ),
+            on_result=lambda r: print_probe_result(args.target, args.port, r),
         )
     except (OSError, ValueError) as exc:
         print(f"ecmp-scan: {exc}", file=sys.stderr)
